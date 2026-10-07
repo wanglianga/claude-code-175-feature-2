@@ -1,0 +1,830 @@
+openapi: 3.0.3
+info:
+  title: 城市租房押金托管·退租验房·争议服务
+  version: "1.0.0"
+  description: |
+    把**合同、押金托管、入住交割、维修记录、退租验房、扣款建议、争议申诉与押金释放**
+    收敛到同一条租赁记录(contract/lease)上的后端服务。
+
+    ## 核心一致性保证
+    * 押金进入托管账户后分为三层金额:`balance`(在管余额)、`disputed_hold`(建议/争议软冻结)、
+      `hard_hold`(双方确认或平台裁决后的定论预留)。
+    * 验房规则引擎只**生成建议**,金额只进入 `disputed_hold`;租客逐项接受才转 `hard_hold`。
+    * 租客一旦申诉,合同进入 `DISPUTING`;**存在未闭合争议时数据库触发器直接拒绝结算确认与放款**。
+    * 争议闭合时资金同事务联动:裁决支持部分转 `hard_hold`,未支持部分立即解冻为可退余额。
+    * 结算必须租客与房东双方确认才放款;押金台账 `fund_ledger` append-only,
+      所有状态变化同时写事务性 outbox 并投递 Kafka 主题 `lease.events`(按 contract_id 分区有序)。
+
+    ## 状态机
+    `SIGNED → LIVING(押金入托管) → CHECKOUT_PENDING / EARLY_TERMINATED → INSPECTING
+     → DEDUCTION_PROPOSED → DISPUTING(可循环) → RELEASED`
+
+    ## 认证
+    演示系统使用固定 Bearer Token(见 README 测试账号),生产应替换 `/api/v1/auth/login` 为密码/短信验证码登录。
+servers:
+  - url: http://localhost:8080
+    description: 本地开发
+tags:
+  - name: auth
+    description: 登录与会话
+  - name: lease
+    description: 合同 / 托管 / 交割 / 维修
+  - name: inspection
+    description: 退租验房与扣款建议
+  - name: dispute
+    description: 争议申诉、补证、协商与平台裁决
+  - name: settlement
+    description: 结算与押金释放
+  - name: admin
+    description: 平台运营
+  - name: ops
+    description: 健康检查
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+  /readyz:
+    get:
+      tags: [ops]
+      summary: 就绪探针(PostgreSQL/Redis/Kafka)
+      responses:
+        "200": {description: 全部依赖可用}
+        "503": {description: 存在不可用依赖}
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: 手机号登录换取 Bearer Token(演示)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: {type: string, example: "13800000001"}
+      responses:
+        "200":
+          description: 会话
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: {type: string}
+                  actor: {$ref: "#/components/schemas/Actor"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/v1/users:
+    post:
+      tags: [lease]
+      summary: 创建用户
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, display_name, role]
+              properties:
+                phone: {type: string}
+                display_name: {type: string}
+                role: {type: string, enum: [TENANT, LANDLORD, AGENT, PLATFORM]}
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+
+  /api/v1/properties:
+    post:
+      tags: [lease]
+      summary: 房东/中介登记房源
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address, city]
+              properties:
+                address: {type: string}
+                city: {type: string}
+                rooms: {type: string}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+
+  /api/v1/contracts:
+    get:
+      tags: [lease]
+      summary: 列出与当前用户相关的合同(平台看全部)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/ContractSummary"}
+    post:
+      tags: [lease]
+      summary: 签约(房东/中介发起,合同进入 SIGNED)
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SignContractRequest"}
+      responses:
+        "201":
+          description: 已签约
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  status: {type: string, example: SIGNED}
+        "403": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}:
+    get:
+      tags: [lease]
+      summary: 一条租赁的完整档案(合同/托管/交割/清单/维修/验房/扣款/争议/台账/事件)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/LeaseTimeline"}
+        "404": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/timeline:
+    get:
+      tags: [lease]
+      summary: 同上(语义别名)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/LeaseTimeline"}
+
+  /api/v1/contracts/{id}/deposit:
+    post:
+      tags: [lease]
+      summary: 租客把押金充入托管账户(SIGNED → LIVING)
+      description: 只有租客本人可以充押金;成功后 `balance=deposit_amount`,写入 DEPOSIT_IN 台账。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200":
+          description: 已托管起租
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: LIVING}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/evidence:
+    post:
+      tags: [lease]
+      summary: 登记证据文件元数据(照片/票据的 sha256 与存储地址)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EvidenceRequest"}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+
+  /api/v1/contracts/{id}/checkin:
+    post:
+      tags: [lease]
+      summary: 入住交割(墙面/地板/家电清单 + 钥匙 + 水电煤读数 + 清洁)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CheckinRequest"}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  handover_id: {type: string, format: uuid}
+                  phase: {type: string, example: CHECKIN}
+
+  /api/v1/contracts/{id}/repairs:
+    post:
+      tags: [lease]
+      summary: 入住期间租客提交维修报修
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, category]
+              properties:
+                title: {type: string}
+                description: {type: string}
+                category: {type: string, enum: [WALL, FLOOR, APPLIANCE, FURNITURE, PLUMBING, ELECTRICAL, DOOR_WINDOW, OTHER]}
+                item_name: {type: string}
+                evidence_ids: {type: array, items: {type: string, format: uuid}}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repair_id: {type: string, format: uuid}
+                  status: {type: string, example: SUBMITTED}
+
+  /api/v1/contracts/{id}/repairs/{rid}/decision:
+    post:
+      tags: [lease]
+      summary: 房东/中介确认维修责任与费用(关联房屋档案,退租时作为判定证据)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+        - {name: rid, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [LANDLORD_RESPONSIBLE, TENANT_RESPONSIBLE, SHARED, REJECTED, COMPLETED]
+                cost_amount: {type: number, format: double}
+                tenant_share: {type: number, format: double}
+                decision_note: {type: string}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+
+  /api/v1/contracts/{id}/checkout:
+    post:
+      tags: [lease]
+      summary: 租客退租交房(可声明提前退租;提交钥匙/清洁/退租水电读数)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CheckoutRequest"}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  handover_id: {type: string, format: uuid}
+
+  /api/v1/contracts/{id}/inspection/start:
+    post:
+      tags: [inspection]
+      summary: 房东/中介发起验房(合同 → INSPECTING),同时自动闭合"逾期不验房"争议
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  inspection_id: {type: string, format: uuid}
+                  status: {type: string, example: OPEN}
+
+  /api/v1/contracts/{id}/inspection/submit:
+    post:
+      tags: [inspection]
+      summary: 提交验房六维结论,规则引擎生成扣款建议并软冻结 disputed_hold
+      description: |
+        六维:墙面、地板、家电、钥匙、水电、清洁。规则依据合同/入住交割基线/维修责任记录判定:
+        自然磨损与入住前损坏产出 **0 元保护性建议**;家电责任不清产出 `APPLIANCE_RESPONSIBILITY_UNCLEAR`;
+        提前退租按合同通知期产出空置损失建议。返回全部建议与合计金额。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SubmitInspectionRequest"}
+      responses:
+        "201":
+          description: 已生成扣款建议,合同进入 DEDUCTION_PROPOSED
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InspectionResult"}
+
+  /api/v1/contracts/{id}/inspection/review:
+    post:
+      tags: [inspection]
+      summary: 租客审阅验房结论(agree=false 要求补证复验)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agree]
+              properties:
+                agree: {type: boolean}
+                comment: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/v1/contracts/{id}/items/{itype}/{iid}/accept:
+    post:
+      tags: [inspection]
+      summary: 租客接受某条扣款建议(disputed_hold → hard_hold)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+        - {name: itype, in: path, required: true, schema: {type: string, enum: [finding, charge]}}
+        - {name: iid, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ACCEPTED}
+
+  /api/v1/contracts/{id}/items/{itype}/{iid}/contest:
+    post:
+      tags: [dispute]
+      summary: 租客对扣款建议申诉(打开争议,合同 → DISPUTING,款项留在 disputed_hold)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+        - {name: itype, in: path, required: true, schema: {type: string, enum: [finding, charge]}}
+        - {name: iid, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  enum:
+                    - WALL_DAMAGE_VS_WEAR
+                    - FLOOR_DAMAGE_VS_WEAR
+                    - APPLIANCE_RESPONSIBILITY
+                    - UTILITY_ARREARS
+                    - KEY_LOSS
+                    - INSPECTION_DELAY
+                    - EARLY_TERMINATION
+                    - CLEANING_FEE
+                    - OTHER
+                subject: {type: string}
+                comment: {type: string}
+                evidence_ids: {type: array, items: {type: string, format: uuid}}
+      responses:
+        "201":
+          description: 争议已打开
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dispute_id: {type: string, format: uuid}
+                  status: {type: string, example: OPEN}
+
+  /api/v1/contracts/{id}/disputes/inspection-delay:
+    post:
+      tags: [dispute]
+      summary: 租客就房东超过合同期限迟迟不验房提起争议
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment: {type: string}
+      responses:
+        "201":
+          description: 逾期争议成立
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dispute_id: {type: string, format: uuid}
+                  reason: {type: string, example: INSPECTION_DELAY}
+        "400":
+          description: 尚未超过合同约定的验房期限
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/disputes:
+    get:
+      tags: [dispute]
+      summary: 列出本租赁全部争议与时间线动作
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: {type: array, items: {$ref: "#/components/schemas/Dispute"}}
+                  actions: {type: array, items: {$ref: "#/components/schemas/DisputeAction"}}
+
+  /api/v1/contracts/{id}/disputes/{did}/actions:
+    post:
+      tags: [dispute]
+      summary: |
+        争议动作:补证 SUBMIT_EVIDENCE / 房东回应 ACKNOWLEDGE·REBUT /
+        平台要求补证 REQUEST_MORE_EVIDENCE / 撤回 WITHDRAW /
+        双方协商 PARTIES_AGREE(带 amount) / 升级 ESCALATE / 平台裁决 ADJUDICATE(带 amount)。
+        闭合争议时同事务完成资金联动与扣款项终态。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+        - {name: did, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - SUBMIT_EVIDENCE
+                    - ACKNOWLEDGE
+                    - REBUT
+                    - REQUEST_MORE_EVIDENCE
+                    - WITHDRAW
+                    - PARTIES_AGREE
+                    - ESCALATE
+                    - ADJUDICATE
+                amount:
+                  type: number
+                  format: double
+                  description: PARTIES_AGREE/ADJUDICATE 时"支持房东"的金额(0=全额驳回)
+                comment: {type: string}
+                deadline_days: {type: integer, description: REQUEST_MORE_EVIDENCE 补证期限}
+                evidence_ids: {type: array, items: {type: string, format: uuid}}
+      responses:
+        "200": {description: 动作成功}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/settlement/propose:
+    post:
+      tags: [settlement]
+      summary: 生成/刷新结算单(扣款=hard_hold,退还=balance-hard_hold)
+      description: 仍存在 disputed_hold(待确认/争议中款项)时返回 409 UNRESOLVED_DISPUTE。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: {type: string}
+      responses:
+        "201":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settlement_id: {type: string, format: uuid}
+                  status: {type: string, example: PROPOSED}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/settlement/confirm:
+    post:
+      tags: [settlement]
+      summary: 租客/房东确认结算;双方都确认后原子放款(房东收扣款,租客收余额)
+      description: |
+        单方确认只记录不释放;双方确认时数据库 settlement_guard 触发器再次校验
+        **无未闭合争议且金额等于 hard_hold**,通过后同事务执行 DEDUCT + RELEASE_TO_TENANT,
+        合同进入 RELEASED。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200": {description: 确认成功(双方齐备则已放款)}
+        "409":
+          description: 存在未闭合争议 / 金额不一致 / 状态不允许
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /api/v1/admin/overdue-inspections:
+    post:
+      tags: [admin]
+      summary: 平台巡检:为超过验房期限仍未验房的合同自动代开验房(仅平台)
+      security: [{bearerAuth: []}]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  opened:
+                    type: array
+                    items: {type: string, format: uuid}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    ContractId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+  responses:
+    Error:
+      description: 业务错误
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          enum: [NOT_FOUND, VALIDATION, CONFLICT, BAD_STATE, UNRESOLVED_DISPUTE, FORBIDDEN, UNAUTHORIZED, INTERNAL]
+        message: {type: string}
+    Actor:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        role: {type: string, enum: [TENANT, LANDLORD, AGENT, PLATFORM]}
+        name: {type: string}
+    ContractSummary:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        lease_no: {type: string}
+        status: {type: string}
+        tenant_id: {type: string, format: uuid}
+        landlord_id: {type: string, format: uuid}
+        deposit_amount: {type: number}
+        start_date: {type: string, format: date}
+        end_date: {type: string, format: date}
+    SignContractRequest:
+      type: object
+      required: [property_id, tenant_id, start_date, end_date, rent_amount, deposit_amount]
+      properties:
+        property_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        agent_id: {type: string, format: uuid}
+        start_date: {type: string, format: date}
+        end_date: {type: string, format: date}
+        rent_amount: {type: number, format: double}
+        deposit_amount: {type: number, format: double}
+        wear_clause: {type: string, description: 合同中的自然磨损约定}
+        notice_days: {type: integer, default: 30, description: 提前退租通知期}
+        inspection_due_days: {type: integer, default: 7, description: 交房后房东须完成验房的天数}
+        payment_due_days: {type: integer, default: 7}
+        lease_no: {type: string}
+    EvidenceRequest:
+      type: object
+      required: [category, sha256, storage_uri]
+      properties:
+        category:
+          type: string
+          enum: [HANDOVER_CHECKIN, HANDOVER_CHECKOUT, INSPECTION, REPAIR, DISPUTE, INVOICE, KEY, UTILITY, CLEANING, OTHER]
+        content_type: {type: string, default: image/jpeg}
+        sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+        size_bytes: {type: integer, format: int64}
+        storage_uri: {type: string}
+        caption: {type: string}
+    MeterReading:
+      type: object
+      required: [kind, reading]
+      properties:
+        kind: {type: string, enum: [WATER, ELECTRIC, GAS]}
+        reading: {type: number}
+        unit_price: {type: number}
+    InventoryItem:
+      type: object
+      required: [name, category, checkin_state]
+      properties:
+        name: {type: string}
+        category: {type: string, enum: [WALL, FLOOR, DOOR_WINDOW, FURNITURE, APPLIANCE, KEY, FIXTURE, OTHER]}
+        brand_model: {type: string}
+        checkin_state: {type: string, enum: [NEW, GOOD, WORN, DAMAGED, MISSING]}
+        checkin_note: {type: string}
+    CheckinRequest:
+      type: object
+      properties:
+        water_meter_reading: {type: number}
+        elec_meter_reading: {type: number}
+        gas_meter_reading: {type: number}
+        keys_handover: {type: string}
+        cleaning_note: {type: string}
+        note: {type: string}
+        evidence_ids: {type: array, items: {type: string, format: uuid}}
+        inventory: {type: array, items: {$ref: "#/components/schemas/InventoryItem"}}
+        meters: {type: array, items: {$ref: "#/components/schemas/MeterReading"}}
+    CheckoutRequest:
+      type: object
+      properties:
+        water_meter_reading: {type: number}
+        elec_meter_reading: {type: number}
+        gas_meter_reading: {type: number}
+        keys_returned: {type: string}
+        cleaning_note: {type: string}
+        note: {type: string}
+        early: {type: boolean, description: 是否提前退租}
+        evidence_ids: {type: array, items: {type: string, format: uuid}}
+        meters: {type: array, items: {$ref: "#/components/schemas/MeterReading"}}
+    SubmitInspectionRequest:
+      type: object
+      required: [wall_status, floor_status, appliance_status, keys_status, utility_status, cleaning_status]
+      properties:
+        wall_status: {type: string, enum: [GOOD, NORMAL_WEAR, DAMAGED]}
+        floor_status: {type: string, enum: [GOOD, NORMAL_WEAR, DAMAGED]}
+        appliance_status: {type: string, enum: [GOOD, NORMAL_WEAR, DAMAGED, MISSING]}
+        keys_status: {type: string, enum: [RETURNED, MISSING, DAMAGED]}
+        utility_status: {type: string, enum: [SETTLED, UNPAID]}
+        cleaning_status: {type: string, enum: [CLEAN, NEEDS_CLEANING]}
+        summary: {type: string}
+        wall_repair_fee: {type: number}
+        floor_repair_fee: {type: number}
+        appliance_fee: {type: number}
+        key_replacement_fee: {type: number}
+        cleaning_fee: {type: number}
+        evidence_ids: {type: array, items: {type: string, format: uuid}}
+    Suggestion:
+      type: object
+      properties:
+        code: {type: string}
+        title: {type: string}
+        detail: {type: string}
+        basis: {type: string}
+        linked_repair_id: {type: string}
+        amount: {type: number}
+        deductible: {type: boolean}
+    ChargeSuggestion:
+      type: object
+      properties:
+        code: {type: string}
+        title: {type: string}
+        detail: {type: string}
+        basis: {type: string}
+        amount: {type: number}
+    InspectionResult:
+      type: object
+      properties:
+        status: {type: string, example: DEDUCTION_PROPOSED}
+        deductible_total: {type: number}
+        facts: {type: array, items: {$ref: "#/components/schemas/Suggestion"}}
+        charges: {type: array, items: {$ref: "#/components/schemas/ChargeSuggestion"}}
+        notes: {type: array, items: {type: string}}
+    Dispute:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        reason: {type: string}
+        subject: {type: string}
+        claimed_amount: {type: number}
+        status: {type: string, enum: [OPEN, EVIDENCE_PENDING, UNDER_REVIEW, RESOLVED_AGREEMENT, RESOLVED_ADJUDICATION, WITHDRAWN]}
+        award_to_landlord: {type: number}
+        award_to_tenant: {type: number}
+        resolution_note: {type: string}
+        created_at: {type: string, format: date-time}
+        resolved_at: {type: string, format: date-time}
+    DisputeAction:
+      type: object
+      properties:
+        id: {type: integer}
+        action:
+          type: string
+          enum: [OPEN, SUBMIT_EVIDENCE, ACKNOWLEDGE, REBUT, REQUEST_MORE_EVIDENCE, PARTIES_AGREE, ESCALATE, ADJUDICATE, WITHDRAW]
+        amount_effect: {type: number}
+        comment: {type: string}
+        created_at: {type: string, format: date-time}
+    LeaseTimeline:
+      type: object
+      properties:
+        contract: {type: object}
+        escrow: {type: object}
+        handovers: {type: array, items: {type: object}}
+        inventory: {type: array, items: {type: object}}
+        repairs: {type: array, items: {type: object}}
+        inspection: {type: object}
+        findings: {type: array, items: {type: object}}
+        charges: {type: array, items: {type: object}}
+        disputes: {type: array, items: {$ref: "#/components/schemas/Dispute"}}
+        settlement: {type: object}
+        fund_ledger: {type: array, items: {type: object}}
+        events: {type: array, items: {type: object}}
+        dispute_actions: {type: array, items: {$ref: "#/components/schemas/DisputeAction"}}
+        open_disputes: {type: integer}
+        available_to_release: {type: number}

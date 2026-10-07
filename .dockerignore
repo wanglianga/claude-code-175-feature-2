@@ -1,0 +1,7 @@
+/tmp/deposit-server
+*.log
+.git
+.idea
+.vscode
+third_party
+web/swagger-ui/*.map
