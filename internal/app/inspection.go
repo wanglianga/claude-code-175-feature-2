@@ -52,6 +52,10 @@ func (s *Service) StartInspection(ctx context.Context, contractID string) (strin
 		if _, err := tx.Exec(ctx, `UPDATE contracts SET status='INSPECTING' WHERE id=$1`, contractID); err != nil {
 			return err
 		}
+		// 房东/中介主动验房 -> 超时任务 COMPLETED; 平台代开 -> SUPERSEDED(均由正常流程接管)。
+		if err := s.finishInspectionTask(tx, ctx, contractID, actor(ctx).Role == "PLATFORM"); err != nil {
+			return err
+		}
 		// 房东开始验房, 租客此前因"迟迟不验房"提起的争议自动闭合(无金额影响)。
 		if _, err := tx.Exec(ctx, `
 			UPDATE disputes SET status='RESOLVED_AGREEMENT', resolved_at=now(),
@@ -68,7 +72,11 @@ func (s *Service) StartInspection(ctx context.Context, contractID string) (strin
 	return inspID, err
 }
 
-// AutoOpenOverdueInspection 供平台定时任务调用: 超过验房期限房东仍未验房时, 平台代开验房。
+// AutoOpenOverdueInspection 供平台定时任务调用。
+//
+// 注意: 房东"到期不验房"的默认处理已由超时验房任务承担
+// (首次提醒 -> 逾期二次提醒 -> 最终期限门禁 -> 自动释放/转人工), 因此本方法不再仅因到期就代开验房;
+// 它只处理租客已就"迟迟不验房"提起 INSPECTION_DELAY 争议的合同, 平台代为开启验房并闭合该争议。
 func (s *Service) AutoOpenOverdueInspection(ctx context.Context) ([]string, error) {
 	if actor(ctx).Role != "PLATFORM" {
 		return nil, fmt.Errorf("%w: platform only", ErrForbidden)
@@ -79,10 +87,9 @@ func (s *Service) AutoOpenOverdueInspection(ctx context.Context) ([]string, erro
 		WHERE c.status IN ('CHECKOUT_PENDING','EARLY_TERMINATED','DISPUTING')
 		  AND h.occurred_at + make_interval(days => c.inspection_due_days) < now()
 		  AND NOT EXISTS (SELECT 1 FROM inspections i WHERE i.contract_id=c.id)
-		  -- DISPUTING 仅处理因房东逾期不验房引起的争议, 扣款争议不得被此流程跳过
-		  AND (c.status <> 'DISPUTING' OR EXISTS (
+		  AND EXISTS (
 		        SELECT 1 FROM disputes d WHERE d.contract_id=c.id AND d.reason='INSPECTION_DELAY'
-		          AND d.status IN ('OPEN','EVIDENCE_PENDING','UNDER_REVIEW')))`)
+		          AND d.status IN ('OPEN','EVIDENCE_PENDING','UNDER_REVIEW'))`)
 	if err != nil {
 		return nil, err
 	}

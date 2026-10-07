@@ -36,7 +36,9 @@ tags:
   - name: settlement
     description: 结算与押金释放
   - name: admin
-    description: 平台运营
+    description: 平台运营(超时验房巡检/自动释放/人工复核)
+  - name: overdue
+    description: 房东超时验房处理(提醒/逾期/自动释放/释放后账外主张)
   - name: ops
     description: 健康检查
 
@@ -617,10 +619,117 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
 
+  /api/v1/notifications:
+    get:
+      tags: [overdue]
+      summary: 当前用户的通知列表(含渠道、送达/打开回执)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: unread, in: query, schema: {type: boolean, default: false}}
+        - {name: limit, in: query, schema: {type: integer, default: 50}}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Notification"}
+
+  /api/v1/contracts/{id}/inspection/view:
+    post:
+      tags: [overdue]
+      summary: 房东/中介打开验房单(记录"房东是否打开验房单",并把提醒标记为已打开)
+      description: 幂等; 若超时任务处于 PENDING 则转为 OPENED, 已逾期则仅记录 opened_at。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      responses:
+        "200": {description: OK}
+
+  /api/v1/contracts/{id}/late-claims:
+    post:
+      tags: [overdue]
+      summary: 押金自动释放后,房东补交超时说明与新证据(账外主张)
+      description: |
+        仅当合同已 RELEASED 且存在超时验房任务时可提交。该主张**只做账外登记**:
+        不回流 escrow、不写资金台账、不产生扣款项,平台即使支持也只能由房东凭复核结论另行追讨,
+        **不能从已释放金额中扣款**。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/LateClaimRequest"}
+      responses:
+        "201":
+          description: 已登记
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claim_id: {type: string, format: uuid}
+                  status: {type: string, example: SUBMITTED}
+                  note: {type: string}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/late-claims/{clid}/review:
+    post:
+      tags: [overdue]
+      summary: 平台复核房东释放后的账外主张(支持金额也不划扣已释放押金)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+        - {name: clid, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [upheld]
+              properties:
+                upheld: {type: boolean, description: 是否支持(支持金额仅作账外追讨依据)}
+                amount: {type: number, format: double}
+                note: {type: string}
+      responses:
+        "200": {description: OK}
+
+  /api/v1/contracts/{id}/manual-review:
+    post:
+      tags: [admin]
+      summary: 平台处理"暂停自动释放、转人工复核"的超时验房任务
+      description: |
+        `RELEASE` 复核门禁通过后释放(走 OVERDUE_MANUAL,触发器再次校验);
+        `RETAIN` 暂不释放继续人工跟进;`REINSPECT` 平台代开验房转正常流程。
+      security: [{bearerAuth: []}]
+      parameters:
+        - {$ref: "#/components/parameters/ContractId"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome: {type: string, enum: [RELEASE, RETAIN, REINSPECT]}
+                note: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Error"}
+
   /api/v1/admin/overdue-inspections:
     post:
       tags: [admin]
-      summary: 平台巡检:为超过验房期限仍未验房的合同自动代开验房(仅平台)
+      summary: 平台巡检:对存在 INSPECTION_DELAY 未闭合争议的合同代开验房(仅平台)
+      description: 不再仅因房东到期未验房就代开(默认由提醒→逾期→自动释放流程处理),仅处理租客已提起逾期争议的合同。
       security: [{bearerAuth: []}]
       responses:
         "200":
@@ -633,6 +742,79 @@ paths:
                   opened:
                     type: array
                     items: {type: string, format: uuid}
+
+  /api/v1/admin/overdue-reminders/scan:
+    post:
+      tags: [admin]
+      summary: 巡检1:超过首次验房期限仍未处理 -> 再次提醒(站内+短信)并标记 OVERDUE
+      security: [{bearerAuth: []}]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reminded:
+                    type: array
+                    items: {type: string, format: uuid}
+
+  /api/v1/admin/final-release/scan:
+    post:
+      tags: [admin]
+      summary: 巡检2:最终期限门禁(未关闭报修/未结账单/未闭合争议)与自动释放
+      description: |
+        第一轮只记录门禁快照;下一轮复核指纹一致且全部干净才自动全额释放。
+        快照之后状态发生变化(报修/账单/争议/资金)则暂停并转 MANUAL_REVIEW。
+      security: [{bearerAuth: []}]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/FinalReleaseScanReport"}
+
+  /api/v1/admin/inspection-tasks:
+    get:
+      tags: [admin]
+      summary: 平台查看超时验房任务(可按状态过滤)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string,
+            enum: [PENDING, OPENED, OVERDUE, COMPLETED, SUPERSEDED, AUTO_RELEASED, MANUAL_REVIEW]}}
+        - {name: limit, in: query, schema: {type: integer, default: 100}}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/InspectionTask"}
+
+  /api/v1/admin/notifications/{nid}/delivery:
+    post:
+      tags: [admin]
+      summary: 短信/推送网关送达回执,更新通知 delivery_status 并留痕
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: nid, in: path, required: true, schema: {type: integer, format: int64}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delivered]
+              properties:
+                delivered: {type: boolean}
+                failure_reason: {type: string}
+      responses:
+        "200": {description: OK}
 
 components:
   securitySchemes:
@@ -689,8 +871,9 @@ components:
         deposit_amount: {type: number, format: double}
         wear_clause: {type: string, description: 合同中的自然磨损约定}
         notice_days: {type: integer, default: 30, description: 提前退租通知期}
-        inspection_due_days: {type: integer, default: 7, description: 交房后房东须完成验房的天数}
+        inspection_due_days: {type: integer, default: 7, description: 交房后房东须完成验房的天数(首次期限)}
         payment_due_days: {type: integer, default: 7}
+        final_release_days: {type: integer, default: 7, description: 首次期限后的自动释放宽限期;最终期限=交房+inspection_due_days+final_release_days}
         lease_no: {type: string}
     EvidenceRequest:
       type: object
@@ -810,6 +993,83 @@ components:
         amount_effect: {type: number}
         comment: {type: string}
         created_at: {type: string, format: date-time}
+    Notification:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        contract_id: {type: string, format: uuid}
+        template: {type: string}
+        vars: {type: object, additionalProperties: true}
+        channel: {type: string, enum: [INBOX, SMS, PUSH]}
+        delivery_status: {type: string, enum: [PENDING, SENT, DELIVERED, FAILED]}
+        delivered_at: {type: string, format: date-time}
+        opened_at: {type: string, format: date-time}
+        read_at: {type: string, format: date-time}
+        failure_reason: {type: string}
+        created_at: {type: string, format: date-time}
+    InspectionTask:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        contract_id: {type: string, format: uuid}
+        status: {type: string, enum: [PENDING, OPENED, OVERDUE, COMPLETED, SUPERSEDED, AUTO_RELEASED, MANUAL_REVIEW]}
+        checkout_at: {type: string, format: date-time}
+        first_deadline: {type: string, format: date-time}
+        final_deadline: {type: string, format: date-time}
+        first_reminded_at: {type: string, format: date-time}
+        second_reminded_at: {type: string, format: date-time}
+        overdue_at: {type: string, format: date-time}
+        opened_at: {type: string, format: date-time}
+        gate_snapshot: {type: object, additionalProperties: true}
+        blocked_reason: {type: string, enum: [OPEN_REPAIRS, UNSETTLED_BILLS, OPEN_DISPUTES, EARLY_TERMINATION, HOLDS, STATE_CHANGED]}
+        auto_released_at: {type: string, format: date-time}
+        release_settlement_id: {type: string, format: uuid}
+        review_outcome: {type: string, enum: [NONE, RELEASED, RETAINED, REINSPECT]}
+        review_note: {type: string}
+        reviewed_at: {type: string, format: date-time}
+        lease_no: {type: string}
+        contract_status: {type: string}
+    TaskEvent:
+      type: object
+      properties:
+        id: {type: integer}
+        task_id: {type: string, format: uuid}
+        event_type: {type: string, enum: [CREATED, FIRST_REMINDER, SECOND_REMINDER, REMINDER_DELIVERED,
+          SHEET_OPENED, OVERDUE_MARKED, COMPLETED, SUPERSEDED, GATE_SNAPSHOT, GATE_BLOCKED, STATE_CHANGED_SUSPEND,
+          AUTO_RELEASED, MANUAL_REVIEW, REVIEW_RESOLVED, LATE_CLAIM_FILED, LATE_CLAIM_RESOLVED]}
+        detail: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+    LateClaim:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        contract_id: {type: string, format: uuid}
+        task_id: {type: string, format: uuid}
+        explanation: {type: string}
+        evidence_ids: {type: array, items: {type: string, format: uuid}}
+        claimed_amount: {type: number}
+        status: {type: string, enum: [SUBMITTED, REVIEWING, RESOLVED_AWARD, RESOLVED_REJECTED]}
+        award_amount: {type: number}
+        decision_note: {type: string}
+        created_at: {type: string, format: date-time}
+        decided_at: {type: string, format: date-time}
+    LateClaimRequest:
+      type: object
+      required: [explanation]
+      properties:
+        explanation: {type: string, description: 房东对超时未验房的说明}
+        evidence_ids: {type: array, items: {type: string, format: uuid}}
+        claimed_amount: {type: number, format: double}
+    FinalReleaseScanReport:
+      type: object
+      properties:
+        reminded: {type: array, items: {type: string, format: uuid}}
+        auto_released: {type: array, items: {type: string, format: uuid}}
+        snapshots_taken: {type: array, items: {type: string, format: uuid}}
+        manual_review: {type: array, items: {type: string, format: uuid}}
+        blocked_reasons:
+          type: object
+          additionalProperties: {type: string}
     LeaseTimeline:
       type: object
       properties:
@@ -819,6 +1079,8 @@ components:
         inventory: {type: array, items: {type: object}}
         repairs: {type: array, items: {type: object}}
         inspection: {type: object}
+        inspection_task: {type: object}
+        inspection_task_events: {type: array, items: {$ref: "#/components/schemas/TaskEvent"}}
         findings: {type: array, items: {type: object}}
         charges: {type: array, items: {type: object}}
         disputes: {type: array, items: {$ref: "#/components/schemas/Dispute"}}
@@ -826,5 +1088,8 @@ components:
         fund_ledger: {type: array, items: {type: object}}
         events: {type: array, items: {type: object}}
         dispute_actions: {type: array, items: {$ref: "#/components/schemas/DisputeAction"}}
+        notifications: {type: array, items: {$ref: "#/components/schemas/Notification"}}
+        late_inspection_claims: {type: array, items: {$ref: "#/components/schemas/LateClaim"}}
         open_disputes: {type: integer}
+        open_repairs: {type: integer}
         available_to_release: {type: number}

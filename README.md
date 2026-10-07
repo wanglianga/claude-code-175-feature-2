@@ -6,6 +6,13 @@
 房东迟迟不验房、租客提前退租、清洁费用争议，统一走证据驱动的争议流程；**只有争议全部闭合、
 扣款全部定论、双方确认结算后，押金才会释放**。
 
+**房东超时验房**由平台自动跟进：租客按时搬离并提交退租申请后，按房屋与合同约定向房东发送
+验房提醒（站内信+短信，记录是否送达、房东是否打开验房单、是否还有未关闭报修）；超过首次
+期限仍未处理则再次提醒并把任务标为逾期；到最终期限**先核验未关闭报修、未结账单、双方正在
+处理的争议**，不会因为定时到了就直接退押金；门禁干净且两轮快照一致才自动全额释放押金，
+释放前一刻状态发生变化则暂停并转人工复核。押金释放后房东只能提交**超时说明和新证据**（账外
+登记），不能从已释放金额中扣款。
+
 技术栈：**Go 1.19 + PostgreSQL 15 + Redis 7 + Kafka 3.7(KRaft)**。后端服务，无业务前端页面；
 接口文档由内嵌 **Swagger UI / OpenAPI 3.x** 提供。
 
@@ -44,6 +51,8 @@ export REDIS_ADDR=127.0.0.1:6379
 export KAFKA_BROKERS=127.0.0.1:9092
 go run ./cmd/server
 # 无 Kafka 环境时可 KAFKA_DISABLED=true（事件仍写入 lease_events 表，只是不投递）
+# 超时验房定时巡检可用 SCHEDULER_ENABLED=false 关闭, 改用平台端点手动驱动
+# export SCHEDULER_ENABLED=true SCHEDULER_INTERVAL_SECONDS=30
 ```
 
 健康检查：
@@ -95,6 +104,9 @@ bash scripts/e2e.sh
 
 # 补充争议场景（51 个断言）：
 bash scripts/e2e-scenarios.sh
+
+# 房东超时验房场景（98 个断言，建议 SCHEDULER_ENABLED=false 手动驱动巡检）：
+bash scripts/e2e-overdue.sh
 ```
 
 ### 4.2 单元测试
@@ -183,26 +195,74 @@ Swagger UI 点击调用，或参考两个脚本里的请求体。
 为 key 发往 Kafka（同一租赁同一分区、严格有序），发送成功才标记 published。语义为
 at-least-once，事件携带 `event_id`，消费方须幂等。关键节点同时写 `notifications` 表。
 
+### 5.6 房东超时验房：提醒 → 逾期 → 门禁 → 自动释放/转人工
+
+租客提交退租交房（`CHECKOUT` handover）时，同事务建立一条 `inspection_tasks`：
+
+```
+交房 0 点 ── 首次提醒(站内 INBOX + 短信 SMS, 记录送达) ── first_deadline = 交房 + inspection_due_days
+     │  房东打开验房单(POST /inspection/view): PENDING→OPENED, 提醒置 opened_at
+     │  房东发起验房: 任务 COMPLETED, 回到正常验房流程
+     ▼ 首次期限已过仍未处理(巡检1 POST /admin/overdue-reminders/scan)
+二次提醒(站内+短信) + 告知租客 + 任务 OVERDUE
+     ▼ final_deadline = first_deadline + final_release_days(巡检2 POST /admin/final-release/scan)
+第一轮: 记录门禁快照 gate_snapshot(不释放)
+第二轮: 复核快照 ── 指纹一致且门禁干净 ──▶ 自动全额退还租客(release_mode=OVERDUE_AUTO)
+                  └─ 任一状态变化(报修/账单/争议/资金/提前退租) ──▶ MANUAL_REVIEW 暂停转人工
+```
+
+**自动释放前的门禁（应用层 `gateMetrics` + 数据库 `assert_overdue_release_clean` 双保险，绕过应用层
+直接改结算单也会被触发器回滚）：**
+
+- 无未闭合争议（`OPEN/EVIDENCE_PENDING/UNDER_REVIEW`）；
+- 无未关闭报修（`SUBMITTED/RESPONSIBILITY_PENDING`）；
+- 无未结账单：`PROPOSED/CONTESTED` 费用项，或退租水电已计费却没有定论费用项；
+- `hard_hold = disputed_hold = 0`（没有任何定论/待定扣款）；
+- 合同不能停留在 `EARLY_TERMINATED`（空置损失尚未处理）。
+
+**状态突变检测**：最终期限先写一次门禁快照，下一轮才释放；两轮之间用结构体语义比较快照指纹，
+任何报修/账单/争议/资金变化都会 `STATE_CHANGED_SUSPEND`，押金不动并转人工，杜绝"定时到了就
+放款"和检查后被钻空子。
+
+**人工复核** `POST /api/v1/contracts/{id}/manual-review`（仅平台）：`RELEASE`（门禁已过后按
+`OVERDUE_MANUAL` 释放，触发器再次校验）/ `RETAIN`（暂不释放继续跟进）/ `REINSPECT`（平台代开
+验房，转正常验房/争议/结算流程）。
+
+**释放后只能账外主张**：合同已 `RELEASED` 后房东 `POST /late-claims` 提交超时说明与新证据
+（`evidence` 在 RELEASED 状态仍可登记），只写入 `late_inspection_claims`，**不回流 escrow、不写
+`fund_ledger`、不产生扣款项**；平台复核即使支持（`RESOLVED_AWARD`）也只是房东另行追讨的依据，
+不会从已释放金额扣款。
+
+**全程留痕**：任务每次状态变化写 `inspection_task_events`（16 类事件，含通知送达回执
+`REMINDER_DELIVERED`、打开验房单 `SHEET_OPENED`、门禁快照 `GATE_SNAPSHOT`、拦截
+`GATE_BLOCKED`、状态突变 `STATE_CHANGED_SUSPEND`），同时写 `lease_events` outbox 投递 Kafka；
+通知的渠道/送达状态/送达时间/打开时间在 `notifications` 中可查（`GET /api/v1/notifications`，
+网关回执走 `POST /admin/notifications/{id}/delivery`）。后台调度器默认开启
+（`SCHEDULER_ENABLED=true`，`SCHEDULER_INTERVAL_SECONDS=30`），两个巡检也可由平台端点手动触发。
+
 ## 6. 项目结构
 
 ```
-cmd/server/            启动入口(迁移/seed/relay/HTTP)
-migrations/            SQL 迁移(表、约束、索引、结算守卫触发器)
+cmd/server/            启动入口(迁移/seed/relay/超时巡检调度器/HTTP)
+migrations/            SQL 迁移(0001 表/约束/结算守卫; 0002 超时验房任务/通知回执/账外主张/超时释放闸门)
 internal/
-  config/              环境变量配置
+  config/              环境变量配置(含 SCHEDULER_ENABLED/SCHEDULER_INTERVAL_SECONDS)
   db/                  PG 连接池与迁移执行
   domain/              领域模型与状态常量
   rules/               退租扣款建议规则引擎(纯函数, 带单测)
   app/                 事务用例: 签约/托管/交割/维修/验房/争议/结算/资金台账/查询/seed
+                       overdue.go 房东超时验房(提醒/逾期/门禁快照/自动释放/人工复核/账外主张)
+                       scheduler.go 周期触发两段巡检
   events/              lease_events outbox -> Kafka relay
   auth/                Redis 会话 Token
   api/                 HTTP 路由、处理器、Swagger 静态资源
 web/
-  openapi.yaml         OpenAPI 3.x 规范(25 个路径)
+  openapi.yaml         OpenAPI 3.x 规范(34 个路径)
   swagger-ui/          内嵌 Swagger UI 静态资源(离线可用)
 scripts/
   e2e.sh               主生命周期端到端验证(41 断言, 含 DB 触发器闸门与跨租户隔离)
   e2e-scenarios.sh     7 类争议场景验证(51 断言)
+  e2e-overdue.sh       房东超时验房 7 大场景验证(98 断言)
   e2e-lib.sh           脚本公共函数
 Dockerfile / docker-compose.yml
 ```
@@ -229,22 +289,48 @@ DRAFT ─签约→ SIGNED ─押金入托管→ LIVING ─退租交房→ CHECKO
                                           RELEASED (余额退还租客 / hard_hold 付房东)
 ```
 
+超时验房是叠加在 `CHECKOUT_PENDING/EARLY_TERMINATED` 之上的**旁路任务**（不改变合同状态机，
+只推动它）：`inspection_tasks` 走 `PENDING → OPENED/OVERDUE → COMPLETED/SUPERSEDED`（房东或平台
+开始验房）或 `OVERDUE → AUTO_RELEASED`（门禁通过）/ `MANUAL_REVIEW`（有未决项或状态突变）。
+自动/人工释放同样把合同置为 `RELEASED`，并受 `settlement_guard` + `assert_overdue_release_clean`
+两级数据库闸门保护。
+
 ## 8. 已执行的验证结论
 
 以下验证在交付环境中实际执行通过：
 
-- `go vet ./...` 无告警；`go build ./...` 通过；`go test ./...` 规则引擎 14 个用例全部通过。
-- 使用本机 PostgreSQL 15（用户级实例，端口 5433）、Redis、Kafka 3.7.2 KRaft 单节点启动服务，
-  `scripts/e2e.sh` **41/41** 断言通过，覆盖：权限隔离（房东不能替租客充押金）、
-  水电煤读数差自动计费（265.00 元）、规则建议金额、`disputed_hold`/`hard_hold` 联动、
-  **争议打开时生成结算被 409 拒绝**、平台裁决部分支持（800→500）后的资金拆分、
-  双方确认后放款与余额清零、15 个领域事件全部投递 Kafka 并可被 console-consumer 读到。
-- `scripts/e2e-scenarios.sh` **51/51** 断言通过，覆盖 7 类争议：
-  自然磨损/入住前损坏免责、家电责任不清裁决全额驳回（OVERTURNED）、清洁费协商折价、
-  提前退租空置损失、钥匙丢失申诉撤回、房东逾期不验房申诉+平台巡检自动代开验房并自动闭合争议。
-- OpenAPI 规范可解析（25 个路径、16 个 schema），`/swagger/`、`/swagger/swagger-ui.css`、
-  `/openapi.yaml` 均返回 200。
+- `gofmt -l` 无输出；`go vet ./...` 无告警；`go build ./...` 通过；`go test ./...` 全部通过
+  （规则引擎 14 个用例 + 超时验房门禁 `gateMetrics`/快照指纹 9 个用例）。
+- 使用本机 PostgreSQL 15（用户级实例，端口 5433）、Redis 启动服务（`KAFKA_DISABLED=true`，
+  本机无 Kafka 二进制；领域事件仍全部写入 `lease_events` outbox 表）：
+  - `scripts/e2e.sh` **39/40** 业务断言通过，唯一未通过项为"事件已投递 Kafka"的 broker 侧断言
+    （1 条 skip：无 console-consumer）；outbox `published` 前置断言通过，Kafka 投递需在具备
+    broker 的 Compose 环境复验。
+  - `scripts/e2e-scenarios.sh` **51/51** 断言通过，覆盖 7 类争议，含"房东逾期不验房 → 租客申诉
+    → 平台代开验房并自动闭合争议"（与新超时任务流程并存兼容）。
+  - `scripts/e2e-overdue.sh` **98/98** 断言通过，覆盖 7 大场景：
+    **A** 退房建任务+首次提醒（站内 DELIVERED/短信 SENT）+打开验房单（PENDING→OPENED、提醒置
+    已打开、重复打开幂等）+正常验房 COMPLETED；
+    **B** 超首次期限二次提醒并 OVERDUE、短信送达/失败回执留痕（REMINDER_DELIVERED）、逾期后打开
+    不回退状态、最终期限未到不释放、通知列表；
+    **C** 最终期限先留快照不释放、复核一致后自动全额退还（OVERDUE_AUTO，余额清零、台账
+    RELEASE_TO_TENANT）、释放后禁止再验房/再生成结算、释放后可登记证据、房东提交超时说明+新证据
+    为账外主张（资金台账与托管三层金额始终不变）、租客无权提交、平台部分支持 300 仍不划扣；
+    **D** 未关闭报修阻断自动释放转 MANUAL_REVIEW（OPEN_REPAIRS，快照记录未决数）、房东不能复核、
+    门禁未过 RELEASE 返回 409、**绕过应用层直接 CONFIRMED OVERDUE_AUTO 结算被 DB 触发器
+    CONFLICT_OPEN_REPAIR 回滚**、定责闭合后平台 OVERDUE_MANUAL 释放；
+    **E** 快照后租客提起逾期争议（释放前状态突变）→ STATE_CHANGED_SUSPEND 暂停转人工、押金不动，
+    平台 REINSPECT 代开验房、争议闭合、合同回 INSPECTING；
+    **F** 提前退租到最终期限不得自动放款（EARLY_TERMINATION），平台 REINSPECT 后验房单保留提前
+    退租标记；
+    **G** 退租水电已计费（240 元）但没有定论费用项也未经验房确认结清时，最终期限按
+    UNSETTLED_BILLS 拦截转人工，且 DB 触发器以 CONFLICT_UNSETTLED_BILL 回滚绕过应用层的 CONFIRMED。
+- 另以 `SCHEDULER_ENABLED=true SCHEDULER_INTERVAL_SECONDS=2` 启动，回拨期限后**不调用任何巡检
+  端点**，验证后台调度器自动完成 `OVERDUE → 门禁快照 → AUTO_RELEASED`，合同 RELEASED、余额 0、
+  全额退还租客。
+- OpenAPI 规范可解析（**34 个路径、22 个 schema**），`/swagger/`、`/openapi.yaml` 均返回 200，
+  `/readyz` 报告 postgres/redis ok。
 
 > 说明：交付环境没有 Docker daemon，因此 `docker compose up` 未在本机实际执行；
 > Dockerfile 为标准多阶段 Go 构建，compose 中 postgres/redis/kafka 均使用官方镜像与健康检查，
-> 请在具备 Docker 的环境按第 1 节启动验证。
+> 请在具备 Docker 的环境按第 1 节启动验证（Compose 默认 `SCHEDULER_ENABLED=true`）。

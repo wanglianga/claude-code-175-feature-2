@@ -12,21 +12,26 @@ import (
 
 // LeaseTimeline 是一条租赁的完整档案视图: 合同/托管/交割/清单/维修/验房/扣款/争议/结算/台账/事件。
 type LeaseTimeline struct {
-	Contract     map[string]any   `json:"contract"`
-	Escrow       map[string]any   `json:"escrow"`
-	Handovers    []map[string]any `json:"handovers"`
-	Inventory    []map[string]any `json:"inventory"`
-	Repairs      []map[string]any `json:"repairs"`
-	Inspection   map[string]any   `json:"inspection"`
-	Findings     []map[string]any `json:"findings"`
-	Charges      []map[string]any `json:"charges"`
-	Disputes     []map[string]any `json:"disputes"`
-	Settlement   map[string]any   `json:"settlement"`
-	Ledger       []map[string]any `json:"fund_ledger"`
-	Events       []map[string]any `json:"events"`
-	Actions      []map[string]any `json:"dispute_actions"`
-	OpenDisputes int              `json:"open_disputes"`
-	Available    float64          `json:"available_to_release"`
+	Contract       map[string]any   `json:"contract"`
+	Escrow         map[string]any   `json:"escrow"`
+	Handovers      []map[string]any `json:"handovers"`
+	Inventory      []map[string]any `json:"inventory"`
+	Repairs        []map[string]any `json:"repairs"`
+	Inspection     map[string]any   `json:"inspection"`
+	InspectionTask map[string]any   `json:"inspection_task"`
+	TaskEvents     []map[string]any `json:"inspection_task_events"`
+	Findings       []map[string]any `json:"findings"`
+	Charges        []map[string]any `json:"charges"`
+	Disputes       []map[string]any `json:"disputes"`
+	Settlement     map[string]any   `json:"settlement"`
+	Ledger         []map[string]any `json:"fund_ledger"`
+	Events         []map[string]any `json:"events"`
+	Actions        []map[string]any `json:"dispute_actions"`
+	Notifications  []map[string]any `json:"notifications"`
+	LateClaims     []map[string]any `json:"late_inspection_claims"`
+	OpenDisputes   int              `json:"open_disputes"`
+	OpenRepairs    int              `json:"open_repairs"`
+	Available      float64          `json:"available_to_release"`
 }
 
 type Queries struct{ pool *pgxpool.Pool }
@@ -109,6 +114,24 @@ func (q *Queries) LeaseTimeline(ctx context.Context, contractID string) (*LeaseT
 	if t.Inspection, err = q.row(ctx, `SELECT * FROM inspections WHERE contract_id=$1`, contractID); err != nil {
 		t.Inspection = map[string]any{}
 	}
+	if t.InspectionTask, err = q.row(ctx, `SELECT * FROM inspection_tasks WHERE contract_id=$1`, contractID); err != nil {
+		t.InspectionTask = map[string]any{}
+	}
+	if t.TaskEvents, err = q.rows(ctx, `
+		SELECT id,task_id::text,event_type,detail,actor_id::text,created_at
+		FROM inspection_task_events WHERE contract_id=$1 ORDER BY id`, contractID); err != nil {
+		return nil, err
+	}
+	if t.Notifications, err = q.rows(ctx, `
+		SELECT id,user_id::text,template,vars,channel,delivery_status,delivered_at,opened_at,
+		       failure_reason,created_at
+		FROM notifications WHERE contract_id=$1 ORDER BY id`, contractID); err != nil {
+		return nil, err
+	}
+	if t.LateClaims, err = q.rows(ctx, `
+		SELECT * FROM late_inspection_claims WHERE contract_id=$1 ORDER BY created_at`, contractID); err != nil {
+		return nil, err
+	}
 	if t.Findings, err = q.rows(ctx, `SELECT * FROM findings WHERE contract_id=$1 ORDER BY created_at`, contractID); err != nil {
 		return nil, err
 	}
@@ -146,7 +169,52 @@ func (q *Queries) LeaseTimeline(ctx context.Context, contractID string) (*LeaseT
 		AND status IN ('OPEN','EVIDENCE_PENDING','UNDER_REVIEW')`, contractID); e == nil {
 		t.OpenDisputes = int(asFloat(r["n"]))
 	}
+	if r, e := q.row(ctx, `SELECT count(*)::int AS n FROM repairs WHERE contract_id=$1
+		AND status IN ('SUBMITTED','RESPONSIBILITY_PENDING')`, contractID); e == nil {
+		t.OpenRepairs = int(asFloat(r["n"]))
+	}
+	// 空列表统一序列化为 [] 而不是 null。
+	for _, sl := range []*[]map[string]any{
+		&t.Handovers, &t.Inventory, &t.Repairs, &t.TaskEvents, &t.Findings, &t.Charges,
+		&t.Disputes, &t.Ledger, &t.Events, &t.Actions, &t.Notifications, &t.LateClaims,
+	} {
+		if *sl == nil {
+			*sl = []map[string]any{}
+		}
+	}
 	return t, nil
+}
+
+// ListNotifications 返回当前用户的通知(送达/打开回执随时间线可审计)。
+func (q *Queries) ListNotifications(ctx context.Context, userID string, onlyUnread bool, limit int) ([]map[string]any, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	sql := `SELECT n.id,n.contract_id::text,n.template,n.vars,n.channel,n.delivery_status,
+	               n.delivered_at,n.opened_at,n.failure_reason,n.read_at,n.created_at
+	          FROM notifications n WHERE n.user_id=$1`
+	if onlyUnread {
+		sql += " AND n.opened_at IS NULL"
+	}
+	sql += " ORDER BY n.id DESC LIMIT $2"
+	return q.rows(ctx, sql, userID, limit)
+}
+
+// ListInspectionTasks 平台视角: 超时验房任务列表, 可按状态过滤。
+func (q *Queries) ListInspectionTasks(ctx context.Context, status string, limit int) ([]map[string]any, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if status != "" {
+		return q.rows(ctx, `
+			SELECT t.*, c.lease_no, c.status AS contract_status
+			  FROM inspection_tasks t JOIN contracts c ON c.id=t.contract_id
+			 WHERE t.status=$1 ORDER BY t.final_deadline LIMIT $2`, status, limit)
+	}
+	return q.rows(ctx, `
+		SELECT t.*, c.lease_no, c.status AS contract_status
+		  FROM inspection_tasks t JOIN contracts c ON c.id=t.contract_id
+		 ORDER BY t.created_at DESC LIMIT $1`, limit)
 }
 
 func (q *Queries) ListContracts(ctx context.Context, role, userID string, limit int) ([]map[string]any, error) {

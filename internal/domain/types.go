@@ -48,6 +48,35 @@ func OpenDisputeStatuses() []string {
 	return []string{DisputeOpen, DisputeEvidencePending, DisputeUnderReview}
 }
 
+// 超时验房任务状态
+const (
+	InspectionTaskPending      = "PENDING"       // 首次提醒已发, 等待房东验房
+	InspectionTaskOpened       = "OPENED"        // 房东已打开验房单(但尚未提交/发起)
+	InspectionTaskOverdue      = "OVERDUE"       // 超过首次期限, 已二次提醒
+	InspectionTaskCompleted    = "COMPLETED"     // 房东正常发起验房, 任务由主流程接管
+	InspectionTaskSuperseded   = "SUPERSEDED"    // 平台代开验房, 任务由主流程接管
+	InspectionTaskAutoReleased = "AUTO_RELEASED" // 最终期限门禁通过, 押金自动全额释放
+	InspectionTaskManualReview = "MANUAL_REVIEW" // 存在未决项或释放前状态突变, 转人工
+)
+
+// 自动释放被拦截的原因
+const (
+	BlockOpenRepairs      = "OPEN_REPAIRS"
+	BlockUnsettledBills   = "UNSETTLED_BILLS"
+	BlockOpenDisputes     = "OPEN_DISPUTES"
+	BlockEarlyTermination = "EARLY_TERMINATION"
+	BlockHolds            = "HOLDS"
+	BlockStateChanged     = "STATE_CHANGED"
+)
+
+// 释放后房东逾期说明/新证据的复核状态
+const (
+	LateClaimSubmitted      = "SUBMITTED"
+	LateClaimReviewing      = "REVIEWING"
+	LateClaimResolvedAward  = "RESOLVED_AWARD"
+	LateClaimResolvedReject = "RESOLVED_REJECTED"
+)
+
 type Contract struct {
 	ID                string    `json:"id"`
 	LeaseNo           string    `json:"lease_no"`
@@ -63,6 +92,7 @@ type Contract struct {
 	NoticeDays        int       `json:"notice_days"`
 	InspectionDueDays int       `json:"inspection_due_days"`
 	PaymentDueDays    int       `json:"payment_due_days"`
+	FinalReleaseDays  int       `json:"final_release_days"`
 	Status            string    `json:"status"`
 	CreatedAt         time.Time `json:"created_at"`
 }

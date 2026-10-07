@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"deposit-escrow/internal/domain"
@@ -31,11 +32,13 @@ var (
 )
 
 type Service struct {
-	pool    *pgxpool.Pool
-	rdb     *redis.Client
-	writer  *kafka.Writer
-	topic   string
-	kafkaOn bool
+	pool     *pgxpool.Pool
+	rdb      *redis.Client
+	writer   *kafka.Writer
+	topic    string
+	kafkaOn  bool
+	sysMu    sync.Mutex
+	sysActor domain.Actor // 定时任务使用的平台身份(懒加载缓存)
 }
 
 func New(pool *pgxpool.Pool, rdb *redis.Client, writer *kafka.Writer, topic string) *Service {
@@ -94,13 +97,30 @@ func (s *Service) emit(tx pgx.Tx, ctx context.Context, contractID, etype string,
 }
 
 func (s *Service) notify(tx pgx.Tx, ctx context.Context, contractID, userID, template string, vars map[string]any) error {
+	_, err := s.notifyCh(tx, ctx, contractID, userID, template, vars, "INBOX")
+	return err
+}
+
+// notifyCh 写入一条多渠道通知并返回其 id。
+// INBOX 站内信天然可达, 直接记 DELIVERED; SMS/PUSH 模拟网关已下发(SENT),
+// 真实送达状态由网关回执 MarkNotificationDelivery 更新。
+func (s *Service) notifyCh(tx pgx.Tx, ctx context.Context, contractID, userID, template string,
+	vars map[string]any, channel string) (int64, error) {
 	if vars == nil {
 		vars = map[string]any{}
 	}
-	_, err := tx.Exec(ctx,
-		`INSERT INTO notifications(contract_id,user_id,template,vars)
-		 VALUES(NULLIF($1,'')::uuid,$2::uuid,$3,$4)`, contractID, userID, template, vars)
-	return err
+	delivery := "DELIVERED"
+	if channel != "INBOX" {
+		delivery = "SENT"
+	}
+	var id int64
+	err := tx.QueryRow(ctx, `
+		INSERT INTO notifications(contract_id,user_id,template,vars,channel,delivery_status,delivered_at)
+		VALUES(NULLIF($1,'')::uuid,$2::uuid,$3,$4,$5,$6,
+		        CASE WHEN $5='INBOX' THEN now() ELSE NULL END)
+		RETURNING id`,
+		contractID, userID, template, vars, channel, delivery).Scan(&id)
+	return id, err
 }
 
 // ledger 追加资金台账并原子更新 escrow 三层金额。
@@ -173,11 +193,13 @@ func (s *Service) getContract(tx pgx.Tx, ctx context.Context, id string) (domain
 	err := tx.QueryRow(ctx, `
 		SELECT id::text, lease_no, property_id::text, landlord_id::text, tenant_id::text,
 		       agent_id::text, start_date::text, end_date::text, rent_amount, deposit_amount,
-		       COALESCE(wear_clause,''), notice_days, inspection_due_days, payment_due_days, status, created_at
+		       COALESCE(wear_clause,''), notice_days, inspection_due_days, payment_due_days,
+		       final_release_days, status, created_at
 		FROM contracts WHERE id=$1`, id).Scan(
 		&c.ID, &c.LeaseNo, &c.PropertyID, &c.LandlordID, &c.TenantID, &c.AgentID,
 		&c.StartDate, &c.EndDate, &c.RentAmount, &c.DepositAmount,
-		&c.WearClause, &c.NoticeDays, &c.InspectionDueDays, &c.PaymentDueDays, &c.Status, &c.CreatedAt)
+		&c.WearClause, &c.NoticeDays, &c.InspectionDueDays, &c.PaymentDueDays,
+		&c.FinalReleaseDays, &c.Status, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}

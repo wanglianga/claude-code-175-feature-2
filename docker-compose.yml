@@ -70,6 +70,9 @@ services:
       KAFKA_TOPIC: lease.events
       AUTO_MIGRATE: "true"
       SEED: "true"
+      # 房东超时验房巡检(首次提醒/逾期二次提醒/最终期限自动释放)
+      SCHEDULER_ENABLED: "true"
+      SCHEDULER_INTERVAL_SECONDS: "30"
     ports:
       - "8080:8080"
 

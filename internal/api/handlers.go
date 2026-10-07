@@ -20,6 +20,7 @@ func (s *Server) Routes() *Router {
 
 	// 认证
 	r.Handle("POST", "api/v1/auth/login", s.login)
+	r.Handle("GET", "api/v1/notifications", s.withAuth(s.listNotifications))
 
 	// 用户/房源
 	r.Handle("POST", "api/v1/users", s.withAuth(s.createUser))
@@ -39,6 +40,7 @@ func (s *Server) Routes() *Router {
 	r.Handle("POST", "api/v1/contracts/{id}/repairs/{rid}/decision", s.withAuth(s.decideRepair))
 
 	r.Handle("POST", "api/v1/contracts/{id}/checkout", s.withAuth(s.requestCheckout))
+	r.Handle("POST", "api/v1/contracts/{id}/inspection/view", s.withAuth(s.openInspectionSheet))
 	r.Handle("POST", "api/v1/contracts/{id}/inspection/start", s.withAuth(s.startInspection))
 	r.Handle("POST", "api/v1/contracts/{id}/inspection/submit", s.withAuth(s.submitInspection))
 	r.Handle("POST", "api/v1/contracts/{id}/inspection/review", s.withAuth(s.reviewInspection))
@@ -53,8 +55,17 @@ func (s *Server) Routes() *Router {
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/propose", s.withAuth(s.proposeSettlement))
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/confirm", s.withAuth(s.confirmSettlement))
 
-	// 平台: 逾期未验房巡检
+	// 房东超时验房: 释放后补交超时说明/新证据, 平台复核账外主张
+	r.Handle("POST", "api/v1/contracts/{id}/late-claims", s.withAuth(s.submitLateClaim))
+	r.Handle("POST", "api/v1/contracts/{id}/late-claims/{clid}/review", s.withAuth(s.reviewLateClaim))
+
+	// 平台: 逾期提醒巡检 / 最终期限自动释放巡检 / 人工复核 / 任务与通知回执
 	r.Handle("POST", "api/v1/admin/overdue-inspections", s.withAuth(s.autoOverdue))
+	r.Handle("POST", "api/v1/admin/overdue-reminders/scan", s.withAuth(s.scanOverdueReminders))
+	r.Handle("POST", "api/v1/admin/final-release/scan", s.withAuth(s.scanFinalRelease))
+	r.Handle("POST", "api/v1/contracts/{id}/manual-review", s.withAuth(s.resolveManualReview))
+	r.Handle("GET", "api/v1/admin/inspection-tasks", s.withAuth(s.listInspectionTasks))
+	r.Handle("POST", "api/v1/admin/notifications/{nid}/delivery", s.withAuth(s.notificationDelivery))
 
 	return r
 }
@@ -361,4 +372,138 @@ func (s *Server) autoOverdue(w http.ResponseWriter, r *http.Request, a app.Actor
 		return
 	}
 	writeJSON(w, 200, map[string]any{"opened": ids})
+}
+
+// ---- 房东超时验房处理 ----
+
+func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	unread := r.URL.Query().Get("unread") == "true"
+	items, err := s.q.ListNotifications(r.Context(), a.ID, unread, limit)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (s *Server) openInspectionSheet(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	err := s.svc.MarkInspectionSheetOpened(app.WithActor(r.Context(), a), Param(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) submitLateClaim(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.LateClaimInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := s.svc.SubmitLateInspectionClaim(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{
+		"claim_id": id, "status": "SUBMITTED",
+		"note": "账外登记, 不回流托管/不从已释放押金扣款",
+	})
+}
+
+func (s *Server) reviewLateClaim(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in struct {
+		Upheld bool    `json:"upheld"`
+		Amount float64 `json:"amount"`
+		Note   string  `json:"note"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	err := s.svc.ReviewLateClaim(app.WithActor(r.Context(), a),
+		Param(r, "id"), Param(r, "clid"), in.Upheld, in.Amount, in.Note)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) scanOverdueReminders(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	if a.Role != "PLATFORM" {
+		writeErr(w, app.ErrForbidden)
+		return
+	}
+	ids, err := s.svc.RunOverdueReminderScan(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"reminded": ids})
+}
+
+func (s *Server) scanFinalRelease(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	if a.Role != "PLATFORM" {
+		writeErr(w, app.ErrForbidden)
+		return
+	}
+	rep, err := s.svc.RunFinalReleaseScan(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, rep)
+}
+
+func (s *Server) resolveManualReview(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.ResolveManualReviewInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	res, err := s.svc.ResolveManualReview(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, res)
+}
+
+func (s *Server) listInspectionTasks(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	if a.Role != "PLATFORM" {
+		writeErr(w, app.ErrForbidden)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := s.q.ListInspectionTasks(r.Context(), r.URL.Query().Get("status"), limit)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (s *Server) notificationDelivery(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	if a.Role != "PLATFORM" {
+		writeErr(w, app.ErrForbidden)
+		return
+	}
+	nid, err := strconv.ParseInt(Param(r, "nid"), 10, 64)
+	if err != nil {
+		writeErr(w, app.ErrValidation)
+		return
+	}
+	var in struct {
+		Delivered     bool   `json:"delivered"`
+		FailureReason string `json:"failure_reason"`
+	}
+	_ = decode(r, &in)
+	if err := s.svc.MarkNotificationDelivery(r.Context(), nid, in.Delivered, in.FailureReason); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }

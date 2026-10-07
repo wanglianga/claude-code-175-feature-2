@@ -71,6 +71,12 @@ func main() {
 	queries := app.NewQueries(pool)
 	srv := api.NewServer(svc, queries, authMgr, rdb)
 
+	if cfg.SchedulerOn {
+		scheduler := app.NewScheduler(svc, time.Duration(cfg.SchedulerEvery)*time.Second)
+		go scheduler.Run(ctx)
+		log.Println("[boot] overdue-inspection scheduler started")
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/swagger/", api.SwaggerHandler())
 	mux.Handle("/openapi.yaml", api.OpenAPIHandler())
