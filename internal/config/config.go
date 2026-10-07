@@ -6,14 +6,15 @@ import (
 )
 
 type Config struct {
-	HTTPAddr      string
-	DatabaseURL   string
-	RedisAddr     string
-	KafkaBrokers  string
-	KafkaTopic    string
-	KafkaDisabled bool
-	AutoMigrate   bool
-	Seed          bool
+	HTTPAddr         string
+	DatabaseURL      string
+	RedisAddr        string
+	KafkaBrokers     string
+	KafkaTopic       string
+	KafkaDisabled    bool
+	AutoMigrate      bool
+	Seed             bool
+	OverdueSweepSecs int
 }
 
 func getenv(k, def string) string {
@@ -25,14 +26,15 @@ func getenv(k, def string) string {
 
 func Load() Config {
 	return Config{
-		HTTPAddr:      getenv("HTTP_ADDR", ":8080"),
-		DatabaseURL:   getenv("DATABASE_URL", "postgres://app@127.0.0.1:5433/deposit?sslmode=disable"),
-		RedisAddr:     getenv("REDIS_ADDR", "127.0.0.1:6379"),
-		KafkaBrokers:  getenv("KAFKA_BROKERS", "127.0.0.1:9092"),
-		KafkaTopic:    getenv("KAFKA_TOPIC", "lease.events"),
-		KafkaDisabled: getenv("KAFKA_DISABLED", "false") == "true",
-		AutoMigrate:   getenv("AUTO_MIGRATE", "true") == "true",
-		Seed:          getenv("SEED", "true") == "true",
+		HTTPAddr:         getenv("HTTP_ADDR", ":8080"),
+		DatabaseURL:      getenv("DATABASE_URL", "postgres://app@127.0.0.1:5433/deposit?sslmode=disable"),
+		RedisAddr:        getenv("REDIS_ADDR", "127.0.0.1:6379"),
+		KafkaBrokers:     getenv("KAFKA_BROKERS", "127.0.0.1:9092"),
+		KafkaTopic:       getenv("KAFKA_TOPIC", "lease.events"),
+		KafkaDisabled:    getenv("KAFKA_DISABLED", "false") == "true",
+		AutoMigrate:      getenv("AUTO_MIGRATE", "true") == "true",
+		Seed:             getenv("SEED", "true") == "true",
+		OverdueSweepSecs: Atoi(getenv("OVERDUE_SWEEP_SECONDS", "60"), 60),
 	}
 }
 

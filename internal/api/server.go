@@ -47,6 +47,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "AMOUNT_EXCEEDS_DEPOSIT", "message": err.Error()})
 	case errors.Is(err, app.ErrForbidden):
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "FORBIDDEN", "message": err.Error()})
+	case errors.Is(err, app.ErrManualReview):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "MANUAL_REVIEW", "message": err.Error()})
 	default:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "INTERNAL", "message": err.Error()})
 	}

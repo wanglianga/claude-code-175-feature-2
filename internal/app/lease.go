@@ -71,6 +71,7 @@ type SignContractInput struct {
 	NoticeDays        int     `json:"notice_days"`
 	InspectionDueDays int     `json:"inspection_due_days"`
 	PaymentDueDays    int     `json:"payment_due_days"`
+	FinalReleaseDays  int     `json:"final_release_days"`
 	LeaseNo           string  `json:"lease_no"`
 }
 
@@ -94,18 +95,27 @@ func (s *Service) SignContract(ctx context.Context, in SignContractInput) (strin
 	if in.PaymentDueDays <= 0 {
 		in.PaymentDueDays = 7
 	}
+	if in.FinalReleaseDays <= 0 {
+		in.FinalReleaseDays = 15
+	}
+	if in.InspectionDueDays >= in.FinalReleaseDays {
+		// 最终释放期限必须晚于首次验房期限, 给房东二次提醒留出处理窗口。
+		return "", fmt.Errorf("%w: final_release_days(%d) must be greater than inspection_due_days(%d)",
+			ErrValidation, in.FinalReleaseDays, in.InspectionDueDays)
+	}
 	var id, landlord string
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO contracts(lease_no,property_id,landlord_id,tenant_id,agent_id,
 			start_date,end_date,rent_amount,deposit_amount,wear_clause,
-			notice_days,inspection_due_days,payment_due_days,status)
+			notice_days,inspection_due_days,payment_due_days,final_release_days,status)
 		SELECT COALESCE(NULLIF($11,''), 'L'||to_char(now(),'YYYYMMDD')||substr(gen_random_uuid()::text,1,6)),
 		       $1, (SELECT landlord_id FROM properties WHERE id=$1), $2, NULLIF($3,'')::uuid,
-		       $4,$5,$6,$7,NULLIF($8,''),$9,$10,$12,'SIGNED'
+		       $4,$5,$6,$7,NULLIF($8,''),$9,$10,$12,$13,'SIGNED'
 		RETURNING id::text, landlord_id::text`,
 		in.PropertyID, in.TenantID, in.AgentID, in.StartDate, in.EndDate,
 		in.RentAmount, in.DepositAmount, in.WearClause,
-		in.NoticeDays, in.InspectionDueDays, in.LeaseNo, in.PaymentDueDays).Scan(&id, &landlord)
+		in.NoticeDays, in.InspectionDueDays, in.LeaseNo, in.PaymentDueDays,
+		in.FinalReleaseDays).Scan(&id, &landlord)
 	if err != nil {
 		return "", fmt.Errorf("sign contract: %w", err)
 	}
@@ -182,7 +192,8 @@ func (s *Service) RegisterEvidence(ctx context.Context, contractID string, in Ev
 	}
 	if err := checkStatus(status,
 		domain.StatusLiving, domain.StatusCheckoutPending, domain.StatusInspecting,
-		domain.StatusDeductionProposed, domain.StatusDisputing, domain.StatusEarlyTerminated); err != nil {
+		domain.StatusDeductionProposed, domain.StatusDisputing, domain.StatusEarlyTerminated,
+		domain.StatusReminding, domain.StatusReleaseReview, domain.StatusReleased); err != nil {
 		return "", err
 	}
 	var id string
@@ -434,8 +445,20 @@ func (s *Service) RequestCheckout(ctx context.Context, contractID string, in Che
 			return err
 		}
 		c, _ := s.getContract(tx, ctx, contractID)
-		_ = s.notify(tx, ctx, contractID, c.LandlordID, "checkout_requested",
-			map[string]any{"early": in.Early, "inspection_due_days": c.InspectionDueDays})
+		var propertyAddr, city string
+		_ = tx.QueryRow(ctx, `SELECT address, city FROM properties WHERE id=$1`,
+			c.PropertyID).Scan(&propertyAddr, &city)
+		// 平台按房屋和合同约定向房东发送首次验房提醒, 并建立自动释放任务
+		// (首次期限=交房+inspection_due_days, 最终期限=交房+final_release_days)。
+		if err := s.createReminderAndJob(tx, ctx, contractID, domain.ReminderFirst,
+			"inspection_reminder_first", map[string]any{
+				"early":               in.Early,
+				"inspection_due_days": c.InspectionDueDays,
+				"final_release_days":  c.FinalReleaseDays,
+				"property":            city + " " + propertyAddr,
+			}); err != nil {
+			return err
+		}
 		return s.emit(tx, ctx, contractID, "CheckoutRequested", map[string]any{
 			"handover_id": handoverID, "early": in.Early, "new_status": newStatus,
 		}, actor(ctx).ID)

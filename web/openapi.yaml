@@ -37,6 +37,8 @@ tags:
     description: 结算与押金释放
   - name: admin
     description: 平台运营
+  - name: overdue
+    description: 房东超时验房处理(催办/逾期/自动释放/人工复核/释放后说明)
   - name: ops
     description: 健康检查
 
@@ -634,6 +636,189 @@ paths:
                     type: array
                     items: {type: string, format: uuid}
 
+  /api/v1/contracts/{id}/inspection/opened:
+    post:
+      tags: [overdue]
+      summary: 房东打开验房单(幂等留痕,记录"是否打开")
+      description: 交房后房东每次进入验房单都可回调; 仅首次会把未打开的提醒置为 opened 并产生事件。
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  newly_opened: {type: integer, description: 本次新标记为已打开的提醒数}
+        "403": {$ref: "#/components/responses/Error"}
+
+  /api/v1/contracts/{id}/reminders:
+    get:
+      tags: [overdue]
+      summary: 查询本租赁的验房提醒与自动释放任务(送达/打开/期限)
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/InspectionReminder"}
+                  job: {$ref: "#/components/schemas/AutoReleaseJob"}
+
+  /api/v1/contracts/{id}/post-release-claims:
+    post:
+      tags: [overdue]
+      summary: 押金释放后房东提交超时说明与新证据(不会自动扣款)
+      description: |
+        仅合同已 RELEASED 后可提交。该接口**只登记与通知**,
+        不会从已退还给租客的押金中自动扣回; 如确需追偿须由平台另案处理。
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [explanation]
+              properties:
+                explanation: {type: string, description: 超时说明}
+                evidence_ids: {type: array, items: {type: string, format: uuid}}
+      responses:
+        "201":
+          description: 已登记
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claim_id: {type: string, format: uuid}
+                  note: {type: string}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/admin/overdue-sweep:
+    post:
+      tags: [overdue]
+      summary: 平台巡检(仅平台):逾期二次提醒 + 最终期限三检查后自动释放或转人工
+      description: |
+        后台每 OVERDUE_SWEEP_SECONDS(默认60) 秒自动调用, 也可手动触发。
+        * 首次期限已过仍未验房 → 发送 OVERDUE 提醒, 任务标 OVERDUE, 合同 REMINDING。
+        * 最终期限已到 → 检查未关闭报修/未结水电账单/未闭合争议, 并比对释放前状态指纹:
+          全部满足则自动生成结算单并全额退还租客; 任一不满足或释放前状态刚变化 →
+          任务 BLOCKED/REVIEW_HUMAN, 合同 RELEASE_REVIEW, 等待人工复核。
+
+        查询参数 `execute=false` 时只做评估(任务停在 READY), 用于在评估与执行之间制造状态变化的验证。
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: execute
+          in: query
+          required: false
+          schema: {type: boolean, default: true}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SweepResult"}
+        "403": {$ref: "#/components/responses/Error"}
+
+  /api/v1/admin/release-jobs:
+    get:
+      tags: [overdue]
+      summary: 平台查看超时验房/自动释放任务列表(仅平台)
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema: {type: string, enum: [PENDING, OVERDUE, READY, BLOCKED, REVIEW_HUMAN, RELEASED, CANCELLED]}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/AutoReleaseJob"}
+
+  /api/v1/admin/contracts/{id}/release-review:
+    post:
+      tags: [overdue]
+      summary: 平台对自动释放暂停的合同做人工复核(仅平台)
+      description: |
+        * RELEASE — 阻断已消除, 重新核验后执行自动释放(仍存在阻断则 409)。
+        * REOPEN_INSPECTION — 平台代开验房, 转回正常验房/争议/结算流程, 任务取消。
+        * KEEP_REVIEW — 仅记录备注, 维持人工挂起。
+      security: [{bearerAuth: []}]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [RELEASE, REOPEN_INSPECTION, KEEP_REVIEW]}
+                note: {type: string}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+        "409": {$ref: "#/components/responses/Error"}
+
+  /api/v1/admin/post-release-claims/{cid}/decision:
+    post:
+      tags: [overdue]
+      summary: 平台裁决释放后的房东超时说明(仅平台, 不自动划扣资金)
+      security: [{bearerAuth: []}]
+      parameters:
+        - name: cid
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [UPHELD, REJECTED]}
+                note: {type: string}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  decision: {type: string}
+                  auto_deducted: {type: boolean, example: false}
+        "409": {$ref: "#/components/responses/Error"}
+
 components:
   securitySchemes:
     bearerAuth:
@@ -689,8 +874,9 @@ components:
         deposit_amount: {type: number, format: double}
         wear_clause: {type: string, description: 合同中的自然磨损约定}
         notice_days: {type: integer, default: 30, description: 提前退租通知期}
-        inspection_due_days: {type: integer, default: 7, description: 交房后房东须完成验房的天数}
+        inspection_due_days: {type: integer, default: 7, description: 交房后房东须完成验房的天数(首次期限)}
         payment_due_days: {type: integer, default: 7}
+        final_release_days: {type: integer, default: 15, description: 交房后自动释放押金的最终期限天数(必须大于 inspection_due_days)}
         lease_no: {type: string}
     EvidenceRequest:
       type: object
@@ -826,5 +1012,82 @@ components:
         fund_ledger: {type: array, items: {type: object}}
         events: {type: array, items: {type: object}}
         dispute_actions: {type: array, items: {$ref: "#/components/schemas/DisputeAction"}}
+        inspection_reminders: {type: array, items: {$ref: "#/components/schemas/InspectionReminder"}}
+        auto_release_job: {$ref: "#/components/schemas/AutoReleaseJob"}
+        post_release_claims: {type: array, items: {$ref: "#/components/schemas/PostReleaseClaim"}}
+        notifications: {type: array, items: {type: object}}
         open_disputes: {type: integer}
         available_to_release: {type: number}
+    InspectionReminder:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        contract_id: {type: string, format: uuid}
+        kind: {type: string, enum: [FIRST, OVERDUE, FINAL]}
+        channel: {type: string, example: INBOX}
+        notification_id: {type: integer}
+        delivered: {type: boolean, description: 通知是否送达}
+        delivered_at: {type: string, format: date-time}
+        opened: {type: boolean, description: 房东是否打开验房单}
+        opened_at: {type: string, format: date-time}
+        first_deadline: {type: string, format: date-time}
+        final_deadline: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    AutoReleaseJob:
+      type: object
+      description: 房东超时未验房时的自动释放任务与全部状态留痕。
+      properties:
+        id: {type: string, format: uuid}
+        contract_id: {type: string, format: uuid}
+        status: {type: string, enum: [PENDING, OVERDUE, READY, BLOCKED, REVIEW_HUMAN, RELEASED, CANCELLED]}
+        first_deadline: {type: string, format: date-time}
+        final_deadline: {type: string, format: date-time}
+        reminded_first_at: {type: string, format: date-time}
+        reminded_overdue_at: {type: string, format: date-time}
+        reminded_final_at: {type: string, format: date-time}
+        overdue_at: {type: string, format: date-time}
+        block_reasons:
+          type: array
+          description: 阻断自动释放的原因(未关闭报修/未结账单/未闭合争议/释放前状态变化)
+          items: {type: string}
+        state_snapshot: {type: object, description: 释放前状态指纹(报修/账单/争议计数与状态序号)}
+        reviewed_by: {type: string, format: uuid}
+        reviewed_at: {type: string, format: date-time}
+        review_note: {type: string}
+        released_at: {type: string, format: date-time}
+        settlement_id: {type: string, format: uuid}
+        lease_no: {type: string}
+        contract_status: {type: string}
+    PostReleaseClaim:
+      type: object
+      description: 押金释放后房东提交的超时说明与新证据(不产生自动扣款)。
+      properties:
+        id: {type: string, format: uuid}
+        contract_id: {type: string, format: uuid}
+        landlord_id: {type: string, format: uuid}
+        explanation: {type: string}
+        evidence_ids: {type: array, items: {type: string, format: uuid}}
+        status: {type: string, enum: [OPEN, REVIEWING, UPHELD, REJECTED]}
+        decision_note: {type: string}
+        decided_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        decided_at: {type: string, format: date-time}
+    SweepResult:
+      type: object
+      properties:
+        overdue:
+          type: array
+          description: 本次二次提醒并标记逾期的合同
+          items: {type: string, format: uuid}
+        auto_released:
+          type: array
+          description: 本次三检查+指纹通过后自动释放押金的合同
+          items: {type: string, format: uuid}
+        paused:
+          type: array
+          description: 本次暂停自动释放、转人工复核的合同
+          items: {type: string, format: uuid}
+        cancelled:
+          type: array
+          description: 房东已自行开验房, 任务取消的合同
+          items: {type: string, format: uuid}

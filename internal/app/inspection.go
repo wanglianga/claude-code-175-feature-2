@@ -35,7 +35,8 @@ func (s *Service) StartInspection(ctx context.Context, contractID string) (strin
 				return fmt.Errorf("%w: DISPUTING 状态仅在逾期验房争议下允许补开验房", ErrBadState)
 			}
 		} else if err := checkStatus(status,
-			domain.StatusCheckoutPending, domain.StatusEarlyTerminated); err != nil {
+			domain.StatusCheckoutPending, domain.StatusEarlyTerminated,
+			domain.StatusReminding); err != nil {
 			return err
 		}
 		c, err := s.getContract(tx, ctx, contractID)
@@ -50,6 +51,19 @@ func (s *Service) StartInspection(ctx context.Context, contractID string) (strin
 			return fmt.Errorf("start inspection: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE contracts SET status='INSPECTING' WHERE id=$1`, contractID); err != nil {
+			return err
+		}
+		// 房东(或平台代房东)已开验房单: 记录打开留痕并取消超时自动释放任务。
+		if _, err := tx.Exec(ctx, `
+			UPDATE inspection_reminders SET opened=true, opened_at=COALESCE(opened_at, now())
+			WHERE contract_id=$1 AND opened=false`, contractID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE auto_release_jobs SET status='CANCELLED', updated_at=now(),
+			       review_note='房东已发起验房, 超时自动释放取消'
+			WHERE contract_id=$1 AND status IN ('PENDING','OVERDUE','READY','BLOCKED')`,
+			contractID); err != nil {
 			return err
 		}
 		// 房东开始验房, 租客此前因"迟迟不验房"提起的争议自动闭合(无金额影响)。
@@ -76,7 +90,7 @@ func (s *Service) AutoOpenOverdueInspection(ctx context.Context) ([]string, erro
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id::text FROM contracts c
 		JOIN handovers h ON h.contract_id=c.id AND h.phase='CHECKOUT'
-		WHERE c.status IN ('CHECKOUT_PENDING','EARLY_TERMINATED','DISPUTING')
+		WHERE c.status IN ('CHECKOUT_PENDING','EARLY_TERMINATED','DISPUTING','REMINDING')
 		  AND h.occurred_at + make_interval(days => c.inspection_due_days) < now()
 		  AND NOT EXISTS (SELECT 1 FROM inspections i WHERE i.contract_id=c.id)
 		  -- DISPUTING 仅处理因房东逾期不验房引起的争议, 扣款争议不得被此流程跳过
@@ -423,7 +437,8 @@ func (s *Service) OpenInspectionDelayDispute(ctx context.Context, contractID, co
 		if err != nil {
 			return err
 		}
-		if st != domain.StatusCheckoutPending && st != domain.StatusEarlyTerminated {
+		if st != domain.StatusCheckoutPending && st != domain.StatusEarlyTerminated &&
+			st != domain.StatusReminding {
 			return fmt.Errorf("%w: 当前状态 %s 不允许逾期申诉", ErrBadState, st)
 		}
 		if !overdue {

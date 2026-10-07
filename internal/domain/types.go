@@ -22,6 +22,31 @@ const (
 	StatusReleased          = "RELEASED"
 	StatusClosed            = "CLOSED"
 	StatusEarlyTerminated   = "EARLY_TERMINATED"
+	// 房东超时验房处理:
+	// REMINDING 首次验房期限已过、平台二次提醒后任务逾期;
+	// RELEASE_REVIEW 最终期限自动释放被暂停, 转平台人工复核。
+	StatusReminding     = "REMINDING"
+	StatusReleaseReview = "RELEASE_REVIEW"
+)
+
+// 验房提醒类型 / 自动释放任务 / 释放后申诉状态
+const (
+	ReminderFirst   = "FIRST"
+	ReminderOverdue = "OVERDUE"
+	ReminderFinal   = "FINAL"
+
+	ReleaseJobPending   = "PENDING"
+	ReleaseJobOverdue   = "OVERDUE"
+	ReleaseJobReady     = "READY"
+	ReleaseJobBlocked   = "BLOCKED"
+	ReleaseJobReview    = "REVIEW_HUMAN"
+	ReleaseJobReleased  = "RELEASED"
+	ReleaseJobCancelled = "CANCELLED"
+
+	PostReleaseClaimOpen      = "OPEN"
+	PostReleaseClaimReviewing = "REVIEWING"
+	PostReleaseClaimUpheld    = "UPHELD"
+	PostReleaseClaimRejected  = "REJECTED"
 )
 
 // 扣款项/费用项状态
@@ -63,6 +88,7 @@ type Contract struct {
 	NoticeDays        int       `json:"notice_days"`
 	InspectionDueDays int       `json:"inspection_due_days"`
 	PaymentDueDays    int       `json:"payment_due_days"`
+	FinalReleaseDays  int       `json:"final_release_days"`
 	Status            string    `json:"status"`
 	CreatedAt         time.Time `json:"created_at"`
 }

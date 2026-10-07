@@ -42,6 +42,9 @@ func (s *Server) Routes() *Router {
 	r.Handle("POST", "api/v1/contracts/{id}/inspection/start", s.withAuth(s.startInspection))
 	r.Handle("POST", "api/v1/contracts/{id}/inspection/submit", s.withAuth(s.submitInspection))
 	r.Handle("POST", "api/v1/contracts/{id}/inspection/review", s.withAuth(s.reviewInspection))
+	// 房东打开验房单(送达/打开留痕) 与提醒查询
+	r.Handle("POST", "api/v1/contracts/{id}/inspection/opened", s.withAuth(s.markInspectionOpened))
+	r.Handle("GET", "api/v1/contracts/{id}/reminders", s.withAuth(s.listReminders))
 
 	r.Handle("POST", "api/v1/contracts/{id}/items/{itype}/{iid}/accept", s.withAuth(s.acceptItem))
 	r.Handle("POST", "api/v1/contracts/{id}/items/{itype}/{iid}/contest", s.withAuth(s.contestItem))
@@ -53,8 +56,15 @@ func (s *Server) Routes() *Router {
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/propose", s.withAuth(s.proposeSettlement))
 	r.Handle("POST", "api/v1/contracts/{id}/settlement/confirm", s.withAuth(s.confirmSettlement))
 
-	// 平台: 逾期未验房巡检
+	// 押金释放后: 房东只能提交超时说明与新证据(不会自动扣款)
+	r.Handle("POST", "api/v1/contracts/{id}/post-release-claims", s.withAuth(s.submitPostReleaseClaim))
+
+	// 平台: 逾期未验房巡检(旧) + 超时验房催办/自动释放巡检(新)
 	r.Handle("POST", "api/v1/admin/overdue-inspections", s.withAuth(s.autoOverdue))
+	r.Handle("POST", "api/v1/admin/overdue-sweep", s.withAuth(s.overdueSweep))
+	r.Handle("GET", "api/v1/admin/release-jobs", s.withAuth(s.listReleaseJobs))
+	r.Handle("POST", "api/v1/admin/contracts/{id}/release-review", s.withAuth(s.resolveReleaseReview))
+	r.Handle("POST", "api/v1/admin/post-release-claims/{cid}/decision", s.withAuth(s.decidePostReleaseClaim))
 
 	return r
 }
@@ -361,4 +371,107 @@ func (s *Server) autoOverdue(w http.ResponseWriter, r *http.Request, a app.Actor
 		return
 	}
 	writeJSON(w, 200, map[string]any{"opened": ids})
+}
+
+// ---------- 房东超时验房处理 ----------
+
+func (s *Server) markInspectionOpened(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	n, err := s.svc.MarkInspectionOpened(app.WithActor(r.Context(), a), Param(r, "id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"newly_opened": n})
+}
+
+func (s *Server) listReminders(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	cid := Param(r, "id")
+	if err := s.q.AssertContractParty(r.Context(), cid, a); err != nil {
+		writeErr(w, err)
+		return
+	}
+	tl, err := s.q.LeaseTimeline(r.Context(), cid)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"items": tl.Reminders,
+		"job":   tl.ReleaseJob,
+	})
+}
+
+func (s *Server) submitPostReleaseClaim(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in app.PostReleaseClaimInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	id, err := s.svc.SubmitPostReleaseClaim(app.WithActor(r.Context(), a), Param(r, "id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{
+		"claim_id": id,
+		"note":     "已登记超时说明; 不会从已释放押金中自动扣款",
+	})
+}
+
+func (s *Server) overdueSweep(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	// 默认完整执行; ?execute=false 只做最终期限评估(任务停在 READY), 用于预检/演示状态变化拦截。
+	execute := r.URL.Query().Get("execute") != "false"
+	res, err := s.svc.SweepOverdueInspections(app.WithActor(r.Context(), a), execute)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, res)
+}
+
+func (s *Server) listReleaseJobs(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	if a.Role != "PLATFORM" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "FORBIDDEN", "message": "platform only"})
+		return
+	}
+	items, err := s.q.ListReleaseJobs(r.Context(), r.URL.Query().Get("status"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (s *Server) resolveReleaseReview(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in struct {
+		Decision string `json:"decision"` // RELEASE / REOPEN_INSPECTION / KEEP_REVIEW
+		Note     string `json:"note"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	err := s.svc.ResolveReleaseReview(app.WithActor(r.Context(), a), Param(r, "id"), in.Decision, in.Note)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) decidePostReleaseClaim(w http.ResponseWriter, r *http.Request, a app.Actor) {
+	var in struct {
+		Decision string `json:"decision"` // UPHELD / REJECTED
+		Note     string `json:"note"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	err := s.svc.DecidePostReleaseClaim(app.WithActor(r.Context(), a), Param(r, "cid"), in.Decision, in.Note)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"decision": in.Decision, "auto_deducted": false})
 }

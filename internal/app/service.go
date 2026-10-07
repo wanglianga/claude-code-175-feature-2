@@ -173,11 +173,13 @@ func (s *Service) getContract(tx pgx.Tx, ctx context.Context, id string) (domain
 	err := tx.QueryRow(ctx, `
 		SELECT id::text, lease_no, property_id::text, landlord_id::text, tenant_id::text,
 		       agent_id::text, start_date::text, end_date::text, rent_amount, deposit_amount,
-		       COALESCE(wear_clause,''), notice_days, inspection_due_days, payment_due_days, status, created_at
+		       COALESCE(wear_clause,''), notice_days, inspection_due_days, payment_due_days,
+		       final_release_days, status, created_at
 		FROM contracts WHERE id=$1`, id).Scan(
 		&c.ID, &c.LeaseNo, &c.PropertyID, &c.LandlordID, &c.TenantID, &c.AgentID,
 		&c.StartDate, &c.EndDate, &c.RentAmount, &c.DepositAmount,
-		&c.WearClause, &c.NoticeDays, &c.InspectionDueDays, &c.PaymentDueDays, &c.Status, &c.CreatedAt)
+		&c.WearClause, &c.NoticeDays, &c.InspectionDueDays, &c.PaymentDueDays,
+		&c.FinalReleaseDays, &c.Status, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
 	}

@@ -12,21 +12,25 @@ import (
 
 // LeaseTimeline 是一条租赁的完整档案视图: 合同/托管/交割/清单/维修/验房/扣款/争议/结算/台账/事件。
 type LeaseTimeline struct {
-	Contract     map[string]any   `json:"contract"`
-	Escrow       map[string]any   `json:"escrow"`
-	Handovers    []map[string]any `json:"handovers"`
-	Inventory    []map[string]any `json:"inventory"`
-	Repairs      []map[string]any `json:"repairs"`
-	Inspection   map[string]any   `json:"inspection"`
-	Findings     []map[string]any `json:"findings"`
-	Charges      []map[string]any `json:"charges"`
-	Disputes     []map[string]any `json:"disputes"`
-	Settlement   map[string]any   `json:"settlement"`
-	Ledger       []map[string]any `json:"fund_ledger"`
-	Events       []map[string]any `json:"events"`
-	Actions      []map[string]any `json:"dispute_actions"`
-	OpenDisputes int              `json:"open_disputes"`
-	Available    float64          `json:"available_to_release"`
+	Contract          map[string]any   `json:"contract"`
+	Escrow            map[string]any   `json:"escrow"`
+	Handovers         []map[string]any `json:"handovers"`
+	Inventory         []map[string]any `json:"inventory"`
+	Repairs           []map[string]any `json:"repairs"`
+	Inspection        map[string]any   `json:"inspection"`
+	Findings          []map[string]any `json:"findings"`
+	Charges           []map[string]any `json:"charges"`
+	Disputes          []map[string]any `json:"disputes"`
+	Settlement        map[string]any   `json:"settlement"`
+	Ledger            []map[string]any `json:"fund_ledger"`
+	Events            []map[string]any `json:"events"`
+	Actions           []map[string]any `json:"dispute_actions"`
+	Reminders         []map[string]any `json:"inspection_reminders"`
+	ReleaseJob        map[string]any   `json:"auto_release_job"`
+	PostReleaseClaims []map[string]any `json:"post_release_claims"`
+	Notifications     []map[string]any `json:"notifications"`
+	OpenDisputes      int              `json:"open_disputes"`
+	Available         float64          `json:"available_to_release"`
 }
 
 type Queries struct{ pool *pgxpool.Pool }
@@ -136,6 +140,25 @@ func (q *Queries) LeaseTimeline(ctx context.Context, contractID string) (*LeaseT
 		WHERE da.contract_id=$1 ORDER BY da.id`, contractID); err != nil {
 		return nil, err
 	}
+	if t.Reminders, err = q.rows(ctx, `
+		SELECT * FROM inspection_reminders WHERE contract_id=$1 ORDER BY created_at`,
+		contractID); err != nil {
+		return nil, err
+	}
+	if t.ReleaseJob, err = q.row(ctx, `
+		SELECT * FROM auto_release_jobs WHERE contract_id=$1`, contractID); err != nil {
+		t.ReleaseJob = map[string]any{}
+	}
+	if t.PostReleaseClaims, err = q.rows(ctx, `
+		SELECT * FROM post_release_claims WHERE contract_id=$1 ORDER BY created_at`,
+		contractID); err != nil {
+		return nil, err
+	}
+	if t.Notifications, err = q.rows(ctx, `
+		SELECT id,template,vars,event_id,read_at,created_at
+		FROM notifications WHERE contract_id=$1 ORDER BY id`, contractID); err != nil {
+		return nil, err
+	}
 	if n, ok := t.Escrow["hard_hold"]; ok {
 		bal := asFloat(t.Escrow["balance"])
 		hard := asFloat(n)
@@ -161,6 +184,20 @@ func (q *Queries) ListContracts(ctx context.Context, role, userID string, limit 
 		deposit_amount,start_date,end_date,created_at FROM contracts
 		WHERE tenant_id=$1 OR landlord_id=$1 OR agent_id=$1
 		ORDER BY created_at DESC LIMIT $2`, userID, limit)
+}
+
+// ListReleaseJobs 平台查看超时验房/自动释放任务; status 为空时返回全部未终结任务。
+func (q *Queries) ListReleaseJobs(ctx context.Context, status string) ([]map[string]any, error) {
+	if status != "" {
+		return q.rows(ctx, `
+			SELECT j.*, c.lease_no, c.status AS contract_status
+			FROM auto_release_jobs j JOIN contracts c ON c.id=j.contract_id
+			WHERE j.status=$1 ORDER BY j.final_deadline`, status)
+	}
+	return q.rows(ctx, `
+		SELECT j.*, c.lease_no, c.status AS contract_status
+		FROM auto_release_jobs j JOIN contracts c ON c.id=j.contract_id
+		ORDER BY j.created_at DESC`)
 }
 
 func asFloat(v any) float64 {

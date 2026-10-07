@@ -71,6 +71,9 @@ func main() {
 	queries := app.NewQueries(pool)
 	srv := api.NewServer(svc, queries, authMgr, rdb)
 
+	// 房东超时验房定时巡检: 首次期限二次提醒/逾期标记, 最终期限三检查+状态指纹后自动释放或转人工。
+	go app.RunOverdueSweeper(ctx, pool, svc, time.Duration(cfg.OverdueSweepSecs)*time.Second)
+
 	mux := http.NewServeMux()
 	mux.Handle("/swagger/", api.SwaggerHandler())
 	mux.Handle("/openapi.yaml", api.OpenAPIHandler())
